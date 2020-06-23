@@ -61,32 +61,44 @@
 
 (defmethod serialize-trait (object (type (eql :date)) name value)
   (if value
-    (jupyter:json-new-obj
-      ("year" (parse-integer value :start 0 :end 4))
-      ("month" (1- (parse-integer value :start 5 :end 7)))
-      ("date" (parse-integer value :start 8 :end 10)))
+    `(:object
+       ("year" . ,(parse-integer value :start 0 :end 4))
+       ("month" . ,(1- (parse-integer value :start 5 :end 7)))
+       ("date" . ,(parse-integer value :start 8 :end 10)))
     :null))
 
-(defmethod deserialize-trait (object (type (eql :date)) name value)
-  (when (cdr value)
-    (format nil "~4,'0D-~2,'0D-~2,'0D"
-                (jupyter:json-getf value "year")
-                (1+ (jupyter:json-getf value "month"))
-                (jupyter:json-getf value "date"))))
+(defmethod deserialize-trait (object (type (eql :date)) name (value hash-table))
+  (format nil "~4,'0D-~2,'0D-~2,'0D"
+              (gethash "year" value 2000)
+              (1+ (gethash "month" value 0))
+              (gethash "date" value 1)))
 
-; Dict
+; object
 
-(defmethod serialize-trait (object (type (eql :dict)) name (value (eql :null)))
+(defmethod serialize-trait (object (type (eql :object)) name (value (eql nil)))
+  :empty-object)
+
+; array
+
+(defmethod serialize-trait (object (type (eql :array)) name (value (eql nil)))
+  :empty-array)
+
+; alist
+
+(defmethod serialize-trait (object (type (eql :alist)) name (value (eql :null)))
   :null)
 
-(defmethod deserialize-trait (object (type (eql :dict)) name (value (eql :null)))
+(defmethod deserialize-trait (object (type (eql :alist)) name (value (eql :null)))
   :null)
 
-(defmethod serialize-trait (object (type (eql :dict)) name (value list))
-  (cons :obj value))
+(defmethod serialize-trait (object (type (eql :alist)) name (value list))
+  (cons :object value))
 
-(defmethod deserialize-trait (object (type (eql :dict)) name (value list))
+(defmethod deserialize-trait (object (type (eql :alist)) name (value list))
   (cdr value))
+
+(defmethod deserialize-trait (object (type (eql :alist)) name (value hash-table))
+  (alexandria:hash-table-alist value))
 
 ; alist list
 
@@ -120,6 +132,9 @@
 (defmethod deserialize-trait (object (type (eql :float-list)) name value)
   (mapcar (lambda (x) (coerce x 'double-float)) value))
 
+(defmethod deserialize-trait (object (type (eql :float-list)) name (value (eql nil)))
+  :empty-array)
+
 ; Link
 
 (defmethod serialize-trait (object (type (eql :link)) name value)
@@ -132,10 +147,15 @@
     (list (deserialize-trait object :widget name (first value))
           (deserialize-trait object :trait-name name (second value)))))
 
+; list
+
+(defmethod deserialize-trait (object (type (eql :list)) name (value (eql nil)))
+  :empty-array)
+
 ; plist snake case
 
 (defmethod serialize-trait (object (type (eql :plist-snake-case)) name value)
-  (cons :obj
+  (cons :object
         (mapcar (lambda (pair)
                   (cons (symbol-to-snake-case (car pair)) (cdr pair)))
                 (alexandria:plist-alist value))))
@@ -149,7 +169,7 @@
 ; plist camel case
 
 (defmethod serialize-trait (object (type (eql :plist-camel-case)) name value)
-  (cons :obj
+  (cons :object
     (mapcar (lambda (pair)
               (cons (symbol-to-camel-case (car pair)) (cdr pair)))
             (alexandria:plist-alist value))))
@@ -192,7 +212,23 @@
 ; Widget List
 
 (defmethod serialize-trait (object (type (eql :widget-list)) name value)
-  (mapcar (lambda (v) (serialize-trait object :widget name v)) value))
+  (map 'vector (lambda (v) (serialize-trait object :widget name v)) value))
 
 (defmethod deserialize-trait (object (type (eql :widget-list)) name value)
-  (mapcar (lambda (v) (deserialize-trait object :widget name v)) value))
+  (map 'list (lambda (v) (deserialize-trait object :widget name v)) value))
+
+(defmethod serialize-trait (object (type (eql :widget-list)) name (value (eql nil)))
+  :empty-array)
+
+; Widget Vector
+
+(defmethod deserialize-trait (object (type (eql :widget-vector)) name value)
+  (map 'vector (lambda (v) (deserialize-trait object :widget name v)) value))
+
+(defmethod serialize-trait (object (type (eql :widget-vector)) name (value (eql nil)))
+  :empty-array)
+
+(defmethod serialize-trait (object (type (eql :widget-vector)) name (value list))
+  (map 'vector (lambda (v) (serialize-trait object :widget name v)) value))
+
+

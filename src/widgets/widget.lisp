@@ -84,112 +84,166 @@
   (:documentation "Base class for all Jupyter widgets."))
 
 (defmethod jupyter:render ((w widget))
-  (jupyter:json-new-obj
-    ("text/plain" "A Jupyter Widget")
-    ("application/vnd.jupyter.widget-view+json"
-      (jupyter:json-new-obj
-        ("version_major" 2)
-        ("version_minor" 0)
-        ("model_id" (jupyter:comm-id w))))))
+  `(:object
+     ("text/plain" . "A Jupyter Widget")
+     ("application/vnd.jupyter.widget-view+json" .
+      (:object
+        ("version_major" . 2)
+        ("version_minor" . 0)
+        ("model_id" . ,(jupyter:comm-id w))))))
 
-(defmethod to-json-state (w &optional nm)
-  (iter
-    (with state = (jupyter:json-empty-obj))
-    (for def in (closer-mop:class-slots (class-of w)))
-    (for name next (closer-mop:slot-definition-name def))
-    (for trait-name next (trait-name name))
-    (for type next (trait-type def))
-    (when (and (or (not nm) (eql trait-name nm))
-               (slot-boundp w name)
-               type
-               (not (eql type t)))
-      (jupyter:json-extend-obj state
-        ((symbol-to-snake-case name)
-          (serialize-trait w type trait-name (slot-value w name)))))
-    (finally (return state))))
+(defun to-json-state (w &optional nm)
+  (cons :object
+        (mapcan (lambda (def)
+                  (let* ((name (closer-mop:slot-definition-name def))
+                         (trait-name (trait-name name))
+                         (type (trait-type def)))
+                    (when (and (or (not nm) (eql trait-name nm))
+                               (slot-boundp w name)
+                               type
+                               (not (eql type t)))
+                      (list (cons (symbol-to-snake-case name)
+                                  (serialize-trait w type trait-name (slot-value w name)))))))
+                (closer-mop:class-slots (class-of w)))))
 
-(defun extract-buffers (state &optional path)
+
+(defun binary-buffer-p (value)
+  (and (vectorp value)
+       (equal (array-element-type value) '(unsigned-byte 8))))
+
+
+(defun contains-binary-buffer-p (value)
+  (or (binary-buffer-p value)
+      (and (hash-table-p value)
+           (with-hash-table-iterator (next-entry value)
+             (prog ()
+              next
+               (multiple-value-bind (more k v) (next-entry)
+                 (declare (ignore k))
+                 (unless more
+                   (return nil))
+                 (when (contains-binary-buffer-p v)
+                   (return t)))
+               (go next))))
+      (and (consp value)
+           (or (contains-binary-buffer-p (car value))
+               (contains-binary-buffer-p (cdr value))))))
+
+
+(defun extract-buffers/hash-table (table path)
+  (let (new-table buffers buffer-paths)
+    (maphash (lambda (key value)
+               (cond
+                 ((binary-buffer-p value)
+                   (push (append path (list key)) buffer-paths)
+                   (push value buffers))
+                 (t
+                   (multiple-value-bind (new-value sub-buffer-paths sub-buffers)
+                                        (extract-buffers value (append path (list key)))
+                     (setf buffer-paths (nconc buffer-paths sub-buffer-paths))
+                     (setf buffers (nconc buffers sub-buffers))
+                     (push (cons key new-value) new-table)))))
+             table)
+    (values (cons :object new-table) buffer-paths buffers)))
+
+
+(defun extract-buffers/object (table path)
+  (let (new-table buffers buffer-paths)
+    (trivial-do:doalist (key value (cdr table) (values (cons :object new-table) buffer-paths buffers))
+      (cond
+        ((binary-buffer-p value)
+          (push (append path (list key)) buffer-paths)
+          (push value buffers))
+        (t
+          (multiple-value-bind (new-value sub-buffer-paths sub-buffers)
+                               (extract-buffers value (append path (list key)))
+            (setf buffer-paths (nconc buffer-paths sub-buffer-paths))
+            (setf buffers (nconc buffers sub-buffers))
+            (push (cons key new-value) new-table)))))))
+
+
+(defun extract-buffers/sequence (seq path)
+  (let (new-list buffers buffer-paths)
+    (trivial-do:doseq* (position value seq (values (nreverse new-list) buffer-paths buffers))
+      (cond
+        ((binary-buffer-p value)
+          (push (append path (list position)) buffer-paths)
+          (push value buffers)
+          (push :null new-list))
+        (t
+          (multiple-value-bind (new-value sub-buffer-paths sub-buffers)
+                               (extract-buffers value (append path (list position)))
+            (setf buffer-paths (nconc buffer-paths sub-buffer-paths))
+            (setf buffers (nconc buffers sub-buffers))
+            (push new-value new-list)))))))
+
+
+(defun extract-buffers (value path)
   (cond
-    ((and (listp state) (eq (first state) :obj))
-      (iter
-        (for (k . v) in (cdr state))
-        (cond
-          ((and (vectorp v) (equal (array-element-type v) '(unsigned-byte 8)))
-            (collect (append path (list k)) into buffer-paths)
-            (collect v into buffers)
-            (jsown:remkey state k))
-          (t
-            (multiple-value-bind (sub-buffer-paths sub-buffers) (extract-buffers v (append path (list k)))
-              (appending sub-buffer-paths into buffer-paths)
-              (appending sub-buffers into buffers))))
-        (finally
-          (return (values buffer-paths buffers)))))
-    ((listp state)
-      (iter
-        (for v in-sequence state with-index i)
-        (cond
-          ((and (vectorp v) (equal (array-element-type v) '(unsigned-byte 8)))
-            (collect (append path (list i)) into buffer-paths)
-            (collect v into buffers)
-            (setf (elt state i) :null))
-          (t
-            (multiple-value-bind (sub-buffer-paths sub-buffers) (extract-buffers v (append path (list i)))
-              (appending sub-buffer-paths into buffer-paths)
-              (appending sub-buffers into buffers))))
-        (finally
-          (return (values buffer-paths buffers)))))
+    ((not (contains-binary-buffer-p value))
+      (values value nil nil))
+    ((hash-table-p value)
+      (extract-buffers/hash-table value path))
+    ((and (listp value)
+          (eql (car value) :object))
+      (extract-buffers/object value path))
+    ((and (listp value)
+          (eql (car value) :array))
+      (multiple-value-bind (new-value buffer-paths buffers)
+                           (extract-buffers/sequence (cdr value) path)
+        (values (cons :array new-value) buffer-paths buffers)))
+    ((typep value 'sequence)
+      (extract-buffers/sequence value path))
     (t
-      (values nil nil))))
+      (values value nil nil))))
+
 
 (defun inject-buffer (state buffer-path buffer)
   (let ((node (car buffer-path))
         (rest (cdr buffer-path)))
     (if rest
       (inject-buffer (if (stringp node)
-                       (jupyter:json-getf state node)
+                       (gethash node state)
                        (elt state node))
                      rest buffer)
       (if (stringp node)
-        (setf (jupyter:json-getf state node) buffer)
+        (setf (gethash node state) buffer)
         (setf (elt state node) buffer)))))
 
 (defun inject-buffers (state buffer-paths buffers)
   (iter
-    (for buffer-path in buffer-paths)
-    (for buffer in buffers)
-    (inject-buffer state buffer-path buffer)))
+    (for buffer-path in-sequence buffer-paths)
+    (for buffer in-sequence buffers)
+    (inject-buffer state (coerce buffer-path 'list) buffer)))
 
 (defun send-state (w &optional name)
   (let ((state (to-json-state w name)))
-    (multiple-value-bind (buffer-paths buffers) (extract-buffers state)
+    (multiple-value-bind (new-state buffer-paths buffers) (extract-buffers state nil)
       (jupyter:send-comm-message w
-        (jupyter:json-new-obj ("method" "update")
-                      ("state" state)
-                      ("buffer_paths" buffer-paths))
-        (jupyter:json-new-obj ("version" +protocol-version+))
+        `(:object ("method" . "update")
+                  ("state" . ,new-state)
+                  ("buffer_paths" . ,(or buffer-paths :empty-array)))
+        `(:object ("version" . ,+protocol-version+))
         buffers))))
 
 (defun update-state (w data buffers)
-  (let ((*trait-source* nil))
-    (iter
-      (with state = (jupyter:json-getf data "state"))
-      (with buffer-paths = (jupyter:json-getf data "buffer_paths"))
-      (inject-buffers state buffer-paths buffers)
-      (with keywords = (jsown:keywords state))
-      (for def in (closer-mop:class-slots (class-of w)))
-      (for name next (closer-mop:slot-definition-name def))
-      (for trait-name next (trait-name name))
-      (for key next (symbol-to-snake-case name))
-      (for type next (trait-type def))
-      (when (position key keywords :test #'equal)
-        (setf (slot-value w name)
-          (deserialize-trait w type trait-name (jupyter:json-getf state key)))))))
+  (let ((*trait-source* nil)
+        (state (gethash "state" data (make-hash-table :test #'equal)))
+        (buffer-paths (gethash "buffer_paths" data)))
+    (inject-buffers state buffer-paths buffers)
+    (dolist (def (closer-mop:class-slots (class-of w)))
+      (let ((name (closer-mop:slot-definition-name def)))
+        (multiple-value-bind (value present-p)
+                             (gethash (symbol-to-snake-case name) state)
+          (when present-p
+            (setf (slot-value w name)
+                  (deserialize-trait w (trait-type def) (trait-name name) value))))))))
 
 (defun send-custom (widget content &optional buffers)
   (jupyter:send-comm-message widget
-    (jupyter:json-new-obj ("method" "custom")
-                  ("content" content))
-    (jupyter:json-new-obj ("version" +protocol-version+))
+    `(:object ("method" . "custom")
+              ("content" . ,content))
+    `(:object ("version" . ,+protocol-version+))
     buffers))
 
 (defgeneric on-custom-message (widget content buffers))
@@ -198,13 +252,13 @@
 
 (defmethod jupyter:on-comm-message ((w widget) data metadata buffers)
   (declare (ignore metadata))
-  (switch ((jupyter:json-getf data "method") :test #'equal)
+  (switch ((gethash "method" data) :test #'equal)
     ("update"
       (update-state w data buffers))
     ("request_state"
       (send-state w))
     ("custom"
-      (on-custom-message w (jupyter:json-getf data "content") buffers))
+      (on-custom-message w (gethash "content" data) buffers))
     (otherwise
       (call-next-method))))
 
@@ -218,21 +272,22 @@
       (call-next-method)
       (unless (getf rest :create-comm)
         (let ((state (to-json-state instance)))
-          (multiple-value-bind (buffer-paths buffers) (extract-buffers state)
+          (jupyter:inform :info instance "~S" state)
+          (multiple-value-bind (new-state buffer-paths buffers) (extract-buffers state nil)
             (jupyter:send-comm-open instance
-              (jupyter:json-new-obj ("state" state)
-                            ("buffer_paths" buffer-paths))
-              (jupyter:json-new-obj ("version" +protocol-version+))
+              `(:object ("state" . ,new-state)
+                        ("buffer_paths" . ,(or buffer-paths :empty-array)))
+              `(:object ("version" . ,+protocol-version+))
               buffers)))))))
 
 (defmethod jupyter:create-comm ((target-name (eql :|jupyter.widget|)) id data metadata buffers)
-  (let* ((state (jupyter:json-getf data "state"))
-         (model-name (jupyter:json-getf state "_model_name"))
-         (model-module (jupyter:json-getf state "_model_module"))
-         (model-module-version (jupyter:json-getf state "_model_module_version"))
-         (view-name (jupyter:json-getf state "_view_name"))
-         (view-module (jupyter:json-getf state "_view_module"))
-         (view-module-version (jupyter:json-getf state "_view_module_version"))
+  (let* ((state (gethash "state" data))
+         (model-name (gethash "_model_name" state))
+         (model-module (gethash "_model_module" state))
+         (model-module-version (gethash "_model_module_version" state))
+         (view-name (gethash "_view_name" state))
+         (view-module (gethash "_view_module" state))
+         (view-module-version (gethash "_view_module_version" state))
          (name (widget-registry-name model-module model-module-version
                                      model-name view-module
                                      view-module-version view-name))
